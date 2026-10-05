@@ -12,6 +12,7 @@ import pytest
 from starlette_context import context, request_cycle_context
 
 from pr_agent import cli
+from pr_agent.algo.run_details import init_run_details, record_command_failure
 from pr_agent.config_loader import get_settings, global_settings
 from pr_agent.git_providers import get_git_provider
 
@@ -35,7 +36,7 @@ def restore_cli_settings():
         settings.set(key, value)
 
 
-def _run_with_result(monkeypatch, result, *, propagate_tool_errors):
+def _run_with_result(monkeypatch, result, *, propagate_tool_errors, record_failure=False):
     fake_settings = SimpleNamespace(
         config={"propagate_tool_errors": propagate_tool_errors},
         litellm={},
@@ -43,6 +44,8 @@ def _run_with_result(monkeypatch, result, *, propagate_tool_errors):
     )
 
     async def fake_handle_request(*_args, **_kwargs):
+        if record_failure:
+            record_command_failure()
         return result
 
     monkeypatch.setattr(cli, "get_settings", lambda: fake_settings)
@@ -84,6 +87,72 @@ def test_run_maps_request_result_to_status(
 
     assert status == expected_status
     assert ("usage:" in capsys.readouterr().out) is prints_help
+
+
+@pytest.mark.parametrize(
+    ("propagate_tool_errors", "record_failure", "expected_status"),
+    [
+        (True, True, 1),
+        (False, True, None),
+        (True, False, None),
+    ],
+)
+def test_run_maps_recorded_tool_failure_to_status(
+    monkeypatch,
+    capsys,
+    propagate_tool_errors,
+    record_failure,
+    expected_status,
+):
+    status = _run_with_result(
+        monkeypatch,
+        True,
+        propagate_tool_errors=propagate_tool_errors,
+        record_failure=record_failure,
+    )
+
+    assert status == expected_status
+    assert "usage:" not in capsys.readouterr().out
+
+
+def test_run_ignores_failure_recorded_before_the_command(monkeypatch):
+    init_run_details()
+    record_command_failure()
+    try:
+        assert _run_with_result(monkeypatch, True, propagate_tool_errors=True) is None
+    finally:
+        init_run_details()
+
+
+@pytest.mark.parametrize(("propagate", "expected_status"), [(True, 1), (False, None)])
+def test_real_tool_recorded_failure_reaches_exit_status(monkeypatch, propagate, expected_status):
+    from pr_agent.agent import pr_agent as pr_agent_module
+
+    class SwallowingReview:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def run(self):
+            # A tool that catches its own error installs its collector on entry,
+            # records the failure and returns normally.
+            init_run_details()
+            record_command_failure()
+
+    monkeypatch.setitem(pr_agent_module.command2class, "review", SwallowingReview)
+    monkeypatch.setattr(pr_agent_module, "apply_repo_settings", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pr_agent_module, "flush_telemetry", lambda: None)
+    monkeypatch.setattr(cli, "inject_artifact_context", lambda: None)
+    monkeypatch.setattr(cli, "litellm_callbacks_registered", lambda: False)
+
+    status = cli.run(
+        inargs=[
+            "--pr_url=https://example.com/org/repo/pull/1",
+            "review",
+            f"--config.propagate_tool_errors={str(propagate).lower()}",
+        ]
+    )
+
+    assert status == expected_status
 
 
 def test_run_reads_effective_setting_after_dispatch(monkeypatch):

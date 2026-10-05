@@ -14,6 +14,7 @@ from pr_agent.algo.ai_handlers.litellm_helpers import (
     litellm_callbacks_registered,
 )
 from pr_agent.algo.artifacts import inject_artifact_context
+from pr_agent.algo.run_details import command_failed, init_run_details
 from pr_agent.algo.run_output import get_version
 from pr_agent.command_descriptions import COMMAND_DESCRIPTIONS
 from pr_agent.config_loader import get_settings
@@ -32,6 +33,20 @@ _PLAIN_DIFF_MARKDOWN_COMMANDS = frozenset({
 _PLAIN_DIFF_JSON_COMMANDS = frozenset({"review", "review_pr"})
 _OUTPUT_OPTIONS = ("--output", "--json-output")
 _CLI_CONTEXT_CACHES = ("git_provider", "repo_settings", "git_files", "diff_files")
+
+
+async def _run_request(target, request):
+    """Run one request and report whether a tool recorded a failure it swallowed.
+
+    The request runs in its own task, so the run-details collector installed during the
+    command lives in that task's context and is gone once the task returns. The verdict
+    has to be read here, inside the task, not by the caller afterwards.
+    """
+    # Start from a fresh collector so a verdict left behind by an earlier command in the
+    # same process cannot leak into this one.
+    init_run_details()
+    result = await PRAgent().handle_request(target, request)
+    return result, command_failed()
 
 
 @contextmanager
@@ -220,10 +235,10 @@ def run(inargs=None, args=None):
             # the same way it does under the GitHub Action. Each asyncio.run gets a fresh task context.
             inject_artifact_context()
             if args.issue_url:
-                result = await asyncio.create_task(PRAgent().handle_request(args.issue_url, [command] + args.rest))
+                result, failed = await asyncio.create_task(_run_request(args.issue_url, [command] + args.rest))
             else:
                 target = args.pr_url if args.pr_url else "local_diff"
-                result = await asyncio.create_task(PRAgent().handle_request(target, [command] + args.rest))
+                result, failed = await asyncio.create_task(_run_request(target, [command] + args.rest))
 
             # litellm defers its success/failure callbacks onto the event loop, which
             # asyncio.run() below tears down the moment this coroutine returns. Give
@@ -234,12 +249,18 @@ def run(inargs=None, args=None):
                     get_settings().litellm.get("callback_timeout_seconds", DEFAULT_CALLBACK_TIMEOUT_SECONDS)
                 )
 
-            return result
+            return result, failed
 
-        result = asyncio.run(inner())
+        result, tool_failed = asyncio.run(inner())
         if not result:
             parser.print_help()
-        if result is False and settings.config.get("propagate_tool_errors", False):
+        propagate = settings.config.get("propagate_tool_errors", False)
+        if result is False and propagate:
+            return 1
+        if tool_failed and propagate:
+            # Same signal the GitHub Action fails on: the tool returned normally but recorded
+            # an error it swallowed, so the run did not do its job.
+            get_logger().warning("Tool reported success but recorded a failure; exiting with status 1")
             return 1
 
 
